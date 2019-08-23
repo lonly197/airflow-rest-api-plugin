@@ -105,7 +105,7 @@ venv.bak/
 
 # idea
 .idea/
-。idea/*
+.idea/*
 
 # log
 log/
