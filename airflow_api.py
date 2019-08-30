@@ -3,7 +3,7 @@
 # @Time    : 2019-08-12 16:16
 # @Author  : lonly
 # @Site    : http://github.com/lonly197
-# @File    : airflow_api.py.py
+# @File    : airflow_api.py
 # @Software: PyCharm
 # @Description: The Restful API For Airflow
 
@@ -19,7 +19,7 @@ import six
 from airflow import configuration
 from airflow import settings
 from airflow.exceptions import AirflowException, AirflowConfigException
-from airflow.models import DagBag, DagRun
+from airflow.models import DagBag, DagRun, DagModel, TaskInstance
 from airflow.plugins_manager import AirflowPlugin
 from airflow.utils.dates import date_range as utils_date_range
 from airflow.utils.state import State
@@ -93,6 +93,19 @@ class ApiUtil:
         pass
 
     @staticmethod
+    def get_dag(dag_id):
+        # check dag_id
+        if dag_id is None:
+            logging.warning("The dag_id argument wasn't provided")
+            raise Exception("The dag_id argument should be provided")
+
+        dagbag = DagBag('dags')
+
+        if dag_id not in dagbag.dags:
+            raise Exception("Dag id {} not found".format(dag_id))
+        return dagbag.get_dag(dag_id)
+
+    @staticmethod
     def format_dag_run(dag_run):
         return {
             'run_id': dag_run.run_id,
@@ -110,6 +123,53 @@ class ApiUtil:
         qry = qry.filter(DagRun.dag_id == dag_id)
         qry = qry.filter(or_(DagRun.run_id == dag_run_id, DagRun.execution_date == execution_date))
         return qry.order_by(DagRun.execution_date).all()
+
+    @staticmethod
+    def format_task_instance(task):
+        return {
+            'dag_id': task.dag_id,
+            'task_id': task.task_id,
+            'job_id': task.job_id,
+            'state': task.state,
+            'start_date': (None if not task.start_date else str(task.start_date)),
+            'end_date': (None if not task.end_date else str(task.end_date)),
+            'execution_date': (None if not task.execution_date else str(task.execution_date)),
+            'queued_dttm': (None if not task.queued_dttm else str(task.queued_dttm)),
+            'hostname': task.hostname,
+            'unixname': task.unixname,
+            'queue': task.queue,
+            'priority_weight': task.priority_weight,
+            'try_number': task.try_number,
+            'pid': task.pid
+        }
+
+    @staticmethod
+    def check_dag_active(dag_id):
+        dagbag = DagBag('dags')
+        dag = dagbag.get_dag(dag_id)
+        return not dag.is_paused
+
+    @staticmethod
+    def pause_dag(dag_id):
+        airflow_cmd_split = ["airflow", "pause", dag_id]
+        cli_output = ApiUtil.execute_cli_command(airflow_cmd_split)
+        logging.info("Pause Dag Result: " + str(cli_output))
+
+    @staticmethod
+    def remove_dag(dag_id):
+        logging.info("Executing custom 'remove_dag' function")
+        dagbag = DagBag('dags')
+        dag = dagbag.get_dag(dag_id)
+        # Get Dag File Path
+        dag_path = dag.full_filepath if dag is not None else os.path.join(airflow_dags_folder, dag_id + ".py")
+        rm_dag_cmd_split = ["rm", "-rf", dag_path]
+        cli_output = ApiUtil.execute_cli_command(rm_dag_cmd_split)
+        logging.info("Remove Dag File[{}] Result: {}".format(dag.full_filepath, str(cli_output)))
+
+        dag_cache_path = os.path.join(airflow_dags_folder, '__pycache__', dag_id + ".cpython-36.pyc")
+        rm_dag_cache_cmd_split = ["rm", "-rf", dag_cache_path]
+        cli_output = ApiUtil.execute_cli_command(rm_dag_cache_cmd_split)
+        logging.info("Remove Dag Cache File[{}] Result: {}".format(dag_cache_path, str(cli_output)))
 
     @staticmethod
     def execute_cli_command_background_mode(airflow_cmd):
@@ -163,6 +223,9 @@ class ApiUtil:
 
 @airflow_api_blueprint.before_request
 def verify_authentication():
+    """
+    Verify Authentication
+    """
     authorization = request.headers.get('authorization')
     try:
         api_auth_key = settings.conf.get('AIRFLOW_API_PLUGIN', 'AIRFLOW_API_AUTH')
@@ -174,9 +237,18 @@ def verify_authentication():
 
 
 @csrf.exempt
-@airflow_api_blueprint.route('/dag/<dag_run_id>', methods=['GET'])
+@airflow_api_blueprint.route('/dag/<dag_id>', methods=['GET'])
 def get_dag(dag_id):
+    """
+    Gets the DAG Info By DagID
+    """
     logging.info("Executing custom 'get_dag' function")
+
+    # check dag_id argument
+    if dag_id is None:
+        logging.warning("The dag_id argument wasn't provided")
+        return ApiResponse.bad_request("The dag_id argument should be provided")
+
     payload = {
         'dag_id': dag_id,
         'full_path': None,
@@ -184,6 +256,8 @@ def get_dag(dag_id):
         'last_execution': None,
     }
     dagbag = DagBag('dags')
+    if dag_id not in dagbag.dags:
+        return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
     dag = dagbag.get_dag(dag_id)
     if dag:
         payload['full_path'] = dag.full_filepath
@@ -192,21 +266,45 @@ def get_dag(dag_id):
     return ApiResponse.success(payload)
 
 
-def _is_active(dag_id):
+@csrf.exempt
+@airflow_api_blueprint.route('/dag/check/<dag_id>', methods=['GET'])
+def check_dag_is_active(dag_id):
+    """
+    Check the DAG is active or not by DagID
+    """
+    logging.info("Executing custom 'check_dag_is_active' function")
+
+    # check dag_id
+    if dag_id is None:
+        logging.warning("The dag_id argument wasn't provided")
+        return ApiResponse.bad_request("The dag_id argument should be provided")
+
     dagbag = DagBag('dags')
+
+    if dag_id not in dagbag.dags:
+        return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
+
     dag = dagbag.get_dag(dag_id)
-    return not dag.is_paused
+    payload = not dag.is_paused
+    return ApiResponse.success(payload)
 
 
 @csrf.exempt
-@airflow_api_blueprint.route('/dag/status/<dag_id>', methods=['GET'])
-def check_dag_status(dag_id):
-    logging.info("Executing custom 'check_dag_status' function")
+@airflow_api_blueprint.route('/dag/exist/<dag_id>', methods=['GET'])
+def check_dag_file_exist(dag_id):
+    logging.info("Executing custom 'check_dag_file_exist' function")
+
+    # check dag_id
+    if dag_id is None:
+        logging.warning("The dag_id argument wasn't provided")
+        return ApiResponse.bad_request("The dag_id argument should be provided")
+
     dagbag = DagBag('dags')
     if dag_id not in dagbag.dags:
         return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
+
     dag = dagbag.get_dag(dag_id)
-    payload = not dag.is_paused
+    payload = os.path.exists(dag.full_filepath)
     return ApiResponse.success(payload)
 
 
@@ -257,7 +355,6 @@ def get_dag_runs():
     dag_runs = []
 
     session = settings.Session()
-
     query = session.query(DagRun)
 
     if request.args.get('state') is not None:
@@ -266,6 +363,12 @@ def get_dag_runs():
     if request.args.get('external_trigger') is not None:
         # query = query.filter(DagRun.external_trigger == (request.args.get('external_trigger') is True))
         query = query.filter(DagRun.external_trigger == (request.args.get('external_trigger') in ['true', 'True']))
+
+    if request.args.get('dag_id') is not None:
+        query = query.filter(DagRun.dag_id == request.args.get('dag_id'))
+
+    if request.args.get('run_id') is not None:
+        query = query.filter(DagRun.run_id == request.args.get('run_id'))
 
     if request.args.get('prefix') is not None:
         query = query.filter(DagRun.run_id.ilike('{}%'.format(request.args.get('prefix'))))
@@ -277,12 +380,13 @@ def get_dag_runs():
 
     session.close()
 
-    return ApiResponse.success({'dag_runs': dag_runs})
+    return ApiResponse.success(dag_runs)
 
 
 @csrf.exempt
 @airflow_api_blueprint.route('/dag_runs', methods=['POST'])
 def create_dag_run():
+    logging.info("Executing custom 'create_dag_run' function")
     # decode input
     data = request.get_json(force=True)
     # ensure there is a dag id
@@ -346,14 +450,11 @@ def create_dag_run():
 
     try:
         session = settings.Session()
-
         dagbag = DagBag('dags')
-
         if dag_id not in dagbag.dags:
             return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
 
         dag = dagbag.get_dag(dag_id)
-
         # ensure run data has all required attributes and that everything is valid, returns transformed data
         runs = utils_date_range(start_date=start_date, end_date=end_date, delta=dag._schedule_interval)
 
@@ -365,21 +466,17 @@ def create_dag_run():
         payloads = []
         for exec_date in runs:
             run_id = '{}_{}'.format(prefix, exec_date.isoformat())
-
             if ApiUtil.find_dag_runs(session, dag_id, run_id, exec_date):
                 continue
-
             payloads.append({
                 'run_id': run_id,
                 'execution_date': exec_date,
                 'conf': conf
             })
-
         results = []
         for index, run in enumerate(payloads):
             if len(results) >= limit:
                 break
-
             dag.create_dagrun(
                 run_id=run['run_id'],
                 execution_date=run['execution_date'],
@@ -405,13 +502,14 @@ def create_dag_run():
 @csrf.exempt
 @airflow_api_blueprint.route('/dag_runs/<dag_run_id>', methods=['GET'])
 def get_dag_run(dag_run_id):
+    logging.info("Executing custom 'get_dag_run' function")
     session = settings.Session()
     runs = DagRun.find(run_id=dag_run_id, session=session)
     if len(runs) == 0:
         return ApiResponse.not_found('Dag run not found')
     dag_run = runs[0]
     session.close()
-    return ApiResponse.success({'dag_run': ApiUtil.format_dag_run(dag_run)})
+    return ApiResponse.success(ApiUtil.format_dag_run(dag_run))
 
 
 # Custom Function for the upload_dag API
@@ -457,8 +555,8 @@ def upload_dag():
         if pause or unpause:
             try:
                 # import the DAG file that was uploaded so that we can get the DAG_ID to execute the command to pause or unpause it
-                import imp
-                dag_file = imp.load_source('module.name', save_file_path)
+                import importlib
+                dag_file = importlib.load_source('module.name', save_file_path)
                 dag_id = dag_file.dag.dag_id
 
                 # run the pause or unpause cli command
@@ -518,8 +616,8 @@ def deploy_dag():
         if pause or unpause:
             try:
                 # import the DAG file that was uploaded so that we can get the DAG_ID to execute the command to pause or unpause it
-                import imp
-                dag_file = imp.load_source('module.name', save_file_path)
+                import importlib
+                dag_file = importlib.load_source('module.name', save_file_path)
                 dag_id = dag_file.dag.dag_id
 
                 # run the pause or unpause cli command
@@ -545,15 +643,34 @@ def deploy_dag():
 @airflow_api_blueprint.route('/dag/refresh/<dag_id>', methods=['GET'])
 def refresh_dag(dag_id):
     logging.info("Executing custom 'refresh_dag' function")
+
+    # Check dag_id argument
+    if dag_id is None:
+        logging.warning("The dag_id argument wasn't provided")
+        return ApiResponse.bad_request("The dag_id argument should be provided")
+    if dag_id not in DagBag('dags').dags:
+        return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
+
+    session = None
     try:
-        from airflow.www.views import Airflow
-        # NOTE: The request argument 'dag_id' is required for the refresh() function to get the dag_id
-        refresh_result = Airflow().refresh()
-        logging.info("Refresh Result: " + str(refresh_result))
+        # TODO: Is this method still needed after AIRFLOW-3561?
+        session = settings.Session()
+        dm = DagModel
+        orm_dag = session.query(dm).filter(dm.dag_id == dag_id).first()
+
+        if orm_dag:
+            orm_dag.last_expired = time.timezone.utcnow()
+            session.merge(orm_dag)
+        session.commit()
+        session.close()
+        logging.info("Refresh Dag Result: {}".format(str(refresh_dag)))
     except Exception as e:
         error_message = "An error occurred while trying to Refresh the DAG '" + str(dag_id) + "': " + str(e)
         logging.error(error_message)
         return ApiResponse.server_error(error_message)
+    finally:
+        if session is not None:
+            session.close()
     return ApiResponse.success("DAG [{}] is now fresh as a daisy".format(dag_id))
 
 
@@ -561,16 +678,23 @@ def refresh_dag(dag_id):
 @airflow_api_blueprint.route('/dag/delete/<dag_id>', methods=['DELETE'])
 def delete_dag(dag_id):
     logging.info("Executing custom 'delete_dag' function")
+
+    # Check dag_id argument
+    if dag_id is None:
+        logging.warning("The dag_id argument wasn't provided")
+        return ApiResponse.bad_request("The dag_id argument should be provided")
+    if dag_id not in DagBag('dags').dags:
+        return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
+
     try:
         # Pause Dag
-        _pause_dag(dag_id)
+        ApiUtil.pause_dag(dag_id)
         # Remove Dag File
-        _remove_dag(dag_id)
+        ApiUtil.remove_dag(dag_id)
         # Recall Airflow Delete URL
-        from airflow.www.views import Airflow
-        # NOTE: The request argument 'dag_id' is required for the delete() function to get the dag_id
-        delete_result = Airflow().delete()
-        logging.info("Delete Result: " + str(delete_result))
+        from airflow.api.common.experimental import delete_dag
+        delete_dag.delete_dag(dag_id)
+        logging.info("Delete Result Success.")
     except Exception as e:
         error_message = "An error occurred while trying to Delete the DAG '" + str(dag_id) + "': " + str(e)
         logging.error(error_message)
@@ -578,39 +702,18 @@ def delete_dag(dag_id):
     return ApiResponse.success("DAG [{}] has been deleted".format(dag_id))
 
 
-def _remove_dag(dag_id):
-    logging.info("Executing custom 'remove_dag' function")
-    dagbag = DagBag('dags')
-    dag = dagbag.get_dag(dag_id)
-    # Get Dag File Path
-    dag_path = dag.full_filepath if dag is not None else os.path.join(airflow_dags_folder, dag_id + ".py")
-    rm_dag_cmd_split = ["rm", "-rf", dag_path]
-    cli_output = ApiUtil.execute_cli_command(rm_dag_cmd_split)
-    logging.info("Remove Dag File[{}] Result: {}".format(dag.full_filepath, str(cli_output)))
-
-    dag_cache_path = os.path.join(airflow_dags_folder, '__pycache__', dag_id + ".cpython-36.pyc")
-    rm_dag_cache_cmd_split = ["rm", "-rf", dag_cache_path]
-    cli_output = ApiUtil.execute_cli_command(rm_dag_cache_cmd_split)
-    logging.info("Remove Dag Cache File[{}] Result: {}".format(dag_cache_path, str(cli_output)))
-
-
 @csrf.exempt
 @airflow_api_blueprint.route('/dag/pause/<dag_id>', methods=['GET'])
 def pause_dag(dag_id):
     logging.info("Executing custom 'pause_dag' function")
+
     try:
-        _pause_dag(dag_id)
+        ApiUtil.pause_dag(dag_id)
     except Exception as e:
         error_message = "An error occurred while trying to pause the DAG '" + str(dag_id) + "': " + str(e)
         logging.error(error_message)
         return ApiResponse.server_error(error_message)
     return ApiResponse.success("DAG [{}] has been paused".format(dag_id))
-
-
-def _pause_dag(dag_id):
-    airflow_cmd_split = ["airflow", "pause", dag_id]
-    cli_output = ApiUtil.execute_cli_command(airflow_cmd_split)
-    logging.info("Pause Dag Result: " + str(cli_output))
 
 
 @csrf.exempt
@@ -632,12 +735,16 @@ def unpause_dag(dag_id):
 @airflow_api_blueprint.route('/dag/trigger/<dag_id>', methods=['GET'])
 def trigger_dag(dag_id):
     logging.info("Executing custom 'trigger_dag' function")
-    try:
-        # Check Dag ID
-        dagbag = DagBag('dags')
-        if dag_id not in dagbag.dags:
-            return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
 
+    # Check dag_id argument
+    if dag_id is None:
+        logging.warning("The dag_id argument wasn't provided")
+        return ApiResponse.bad_request("The dag_id argument should be provided")
+    dagbag = DagBag('dags')
+    if dag_id not in DagBag('dags').dags:
+        return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
+
+    try:
         # Get Dag From DagBag
         dag = dagbag.get_dag(dag_id)
         # Check Dag Status
@@ -648,11 +755,11 @@ def trigger_dag(dag_id):
             cli_output = ApiUtil.execute_cli_command(airflow_cmd_split)
             logging.info("UnPause Dag Result: " + str(cli_output))
             # Check Dag Status again
-            if not _is_active(dag_id):
+            if not ApiUtil.check_dag_active(dag_id):
                 raise Exception("Dag is still not active")
 
                 # Trigger Dag By Dag ID
-        airflow_cmd_split = ["airflow", "trigger_dag", dag_id]
+        airflow_cmd_split = ["airflow", "trigger_dag"]
 
         run_id = request.args.get('run_id')
         if run_id is not None:
@@ -664,6 +771,7 @@ def trigger_dag(dag_id):
             logging.info("trigger dag execution_date: " + str(execution_date))
             airflow_cmd_split.extend(["-e", execution_date])
 
+        airflow_cmd_split.append(dag_id)
         cli_output = ApiUtil.execute_cli_command(airflow_cmd_split)
         logging.info("Trigger Dag Result: " + str(cli_output))
 
@@ -675,22 +783,37 @@ def trigger_dag(dag_id):
 
 
 @csrf.exempt
-@airflow_api_blueprint.route('/dag/log', methods=['GET'])
-def get_dag_log():
+@airflow_api_blueprint.route('/dag/log/<dag_id>', methods=['GET'])
+def get_dag_log(dag_id):
     logging.info("Executing custom 'get_dag_log' function")
+
+    # check dag_id
+    if dag_id is None:
+        logging.warning("The dag_id argument wasn't provided")
+        return ApiResponse.bad_request("The dag_id argument should be provided")
+
+    if dag_id not in DagBag('dags').dags:
+        return ApiResponse.bad_request("Dag id {} not found".format(dag_id))
+
+    session = None
     try:
-        # Recall Airflow Delete URL
-        from airflow.www.views import Airflow
-        # NOTE: The request argument 'dag_id', 'task_id' and 'execution_date' is required for the delete() function to get the dag_id
-        return Airflow().get_logs_with_metadata()
-        # logging.info("Get Dag Log Result: " + str(json.dumps(result)))
-        # return ApiResponse.success(str(json.dumps(result)))
+        session = settings.Session()
+        tasks = session.query(TaskInstance).filter(TaskInstance.dag_id == dag_id).all()
+
+        session.close()
+        dag_tasks = []
+
+        for task in tasks:
+            dag_tasks.append(ApiUtil.format_task_instance(task))
+
+        return ApiResponse.success(dag_tasks)
     except Exception as e:
-        dag_id = request.args.get('dag_id', "none")
-        error_message = "An error occurred while trying to get_logs_with_metadata of DAG '" + str(dag_id) + "': " + str(
-            e)
+        error_message = "An error occurred while trying to get_dag_log of DAG '" + str(dag_id) + "': " + str(e)
         logging.error(error_message)
         return ApiResponse.server_error(error_message)
+    finally:
+        if session is not None:
+            session.close()
 
 
 @csrf.exempt
