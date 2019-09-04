@@ -7,6 +7,7 @@
 # @Software: PyCharm
 # @Description: The Restful API For Airflow
 
+
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import subprocess
 import time
 from datetime import datetime
 
+import pendulum
 import six
 from airflow import configuration
 from airflow import settings
@@ -99,11 +101,15 @@ class ApiUtil:
             logging.warning("The dag_id argument wasn't provided")
             raise Exception("The dag_id argument should be provided")
 
-        dagbag = DagBag('dags')
-
-        if dag_id not in dagbag.dags:
-            raise Exception("Dag id {} not found".format(dag_id))
-        return dagbag.get_dag(dag_id)
+        try:
+            dagbag = DagBag('dags')
+            if dag_id not in dagbag.dags:
+                raise Exception("Dag id {} not found".format(dag_id))
+            return dagbag.get_dag(dag_id)
+        except Exception as e:
+            error_message = "An error occurred while trying to get_dag'" + "': " + str(e)
+            logging.error(error_message)
+            return ApiResponse.server_error(error_message)
 
     @staticmethod
     def format_dag_run(dag_run):
@@ -131,13 +137,14 @@ class ApiUtil:
             'task_id': task.task_id,
             'job_id': task.job_id,
             'state': task.state,
+            'execution_date': (None if not task.execution_date else str(task.execution_date)),
             'start_date': (None if not task.start_date else str(task.start_date)),
             'end_date': (None if not task.end_date else str(task.end_date)),
-            'execution_date': (None if not task.execution_date else str(task.execution_date)),
-            'queued_dttm': (None if not task.queued_dttm else str(task.queued_dttm)),
+            'duration': task.duration,
             'hostname': task.hostname,
             'unixname': task.unixname,
             'queue': task.queue,
+            'queued_dttm': (None if not task.queued_dttm else str(task.queued_dttm)),
             'priority_weight': task.priority_weight,
             'try_number': task.try_number,
             'pid': task.pid
@@ -267,7 +274,7 @@ def get_dag(dag_id):
 
 
 @csrf.exempt
-@airflow_api_blueprint.route('/dag/check/<dag_id>', methods=['GET'])
+@airflow_api_blueprint.route('/dag/is_active/<dag_id>', methods=['GET'])
 def check_dag_is_active(dag_id):
     """
     Check the DAG is active or not by DagID
@@ -336,22 +343,22 @@ def list_dags():
 
 @csrf.exempt
 @airflow_api_blueprint.route('/dag_stats', methods=['GET'])
-def get_dag_stats():
-    logging.info("Executing custom 'get_dag_stats' function")
+def list_dag_stats():
+    logging.info("Executing custom 'list_dag_stats' function")
     try:
         # Recall Airflow Delete URL
         from airflow.www.views import Airflow
         return Airflow().dag_stats()
     except Exception as e:
-        error_message = "An error occurred while trying to dag_stats'" + "': " + str(e)
+        error_message = "An error occurred while trying to list_dag_stats'" + "': " + str(e)
         logging.error(error_message)
         return ApiResponse.server_error(error_message)
 
 
 @csrf.exempt
 @airflow_api_blueprint.route('/dag_runs', methods=['GET'])
-def get_dag_runs():
-    logging.info("Executing custom 'get_dag_runs' function")
+def list_dag_runs():
+    logging.info("Executing custom 'list_dag_runs' function")
     dag_runs = []
 
     session = settings.Session()
@@ -384,7 +391,7 @@ def get_dag_runs():
 
 
 @csrf.exempt
-@airflow_api_blueprint.route('/dag_runs', methods=['POST'])
+@airflow_api_blueprint.route('/dag_run/create', methods=['POST'])
 def create_dag_run():
     logging.info("Executing custom 'create_dag_run' function")
     # decode input
@@ -500,15 +507,15 @@ def create_dag_run():
 
 
 @csrf.exempt
-@airflow_api_blueprint.route('/dag_runs/<dag_run_id>', methods=['GET'])
+@airflow_api_blueprint.route('/dag_run/<dag_run_id>', methods=['GET'])
 def get_dag_run(dag_run_id):
     logging.info("Executing custom 'get_dag_run' function")
     session = settings.Session()
     runs = DagRun.find(run_id=dag_run_id, session=session)
+    session.close()
     if len(runs) == 0:
         return ApiResponse.not_found('Dag run not found')
     dag_run = runs[0]
-    session.close()
     return ApiResponse.success(ApiUtil.format_dag_run(dag_run))
 
 
@@ -555,8 +562,13 @@ def upload_dag():
         if pause or unpause:
             try:
                 # import the DAG file that was uploaded so that we can get the DAG_ID to execute the command to pause or unpause it
-                import importlib
-                dag_file = importlib.load_source('module.name', save_file_path)
+                # import importlib.machinery, importlib.util
+                # loader = importlib.machinery.SourceFileLoader('my_module', save_file_path)
+                # spec = importlib.util.spec_from_loader(loader.name, loader)
+                # my_module = importlib.util.module_from_spec(spec)
+                # dag_file = loader.load_module(my_module)
+                import imp
+                dag_file = imp.load_source('module.name', save_file_path)
                 dag_id = dag_file.dag.dag_id
 
                 # run the pause or unpause cli command
@@ -616,8 +628,13 @@ def deploy_dag():
         if pause or unpause:
             try:
                 # import the DAG file that was uploaded so that we can get the DAG_ID to execute the command to pause or unpause it
-                import importlib
-                dag_file = importlib.load_source('module.name', save_file_path)
+                # import importlib.machinery, importlib.util
+                # loader = importlib.machinery.SourceFileLoader('my_module', save_file_path)
+                # spec = importlib.util.spec_from_loader(loader.name, loader)
+                # my_module = importlib.util.module_from_spec(spec)
+                # dag_file = loader.load_module(my_module)
+                import imp
+                dag_file = imp.load_source('module.name', save_file_path)
                 dag_id = dag_file.dag.dag_id
 
                 # run the pause or unpause cli command
@@ -638,7 +655,6 @@ def deploy_dag():
 
 
 # Custom Function for the refresh_dag API
-# This will call the direct function corresponding to the web endpoint '/admin/airflow/refresh' that already exists in Airflow
 @csrf.exempt
 @airflow_api_blueprint.route('/dag/refresh/<dag_id>', methods=['GET'])
 def refresh_dag(dag_id):
@@ -783,9 +799,9 @@ def trigger_dag(dag_id):
 
 
 @csrf.exempt
-@airflow_api_blueprint.route('/dag/log/<dag_id>', methods=['GET'])
-def get_dag_log(dag_id):
-    logging.info("Executing custom 'get_dag_log' function")
+@airflow_api_blueprint.route('/task_runs/<dag_id>', methods=['GET'])
+def list_task_instances(dag_id):
+    logging.info("Executing custom 'list_task_instances' function")
 
     # check dag_id
     if dag_id is None:
@@ -808,7 +824,7 @@ def get_dag_log(dag_id):
 
         return ApiResponse.success(dag_tasks)
     except Exception as e:
-        error_message = "An error occurred while trying to get_dag_log of DAG '" + str(dag_id) + "': " + str(e)
+        error_message = "An error occurred while trying to list_task_instances of DAG '" + str(dag_id) + "': " + str(e)
         logging.error(error_message)
         return ApiResponse.server_error(error_message)
     finally:
@@ -817,15 +833,128 @@ def get_dag_log(dag_id):
 
 
 @csrf.exempt
+@airflow_api_blueprint.route('/task_run/<job_id>', methods=['GET'])
+def get_dag_task_instance(job_id):
+    logging.info("Executing custom 'get_dag_task_instance' function")
+
+    # check dag_id
+    if job_id is None:
+        logging.warning("The job_id argument wasn't provided")
+        return ApiResponse.bad_request("The job_id argument should be provided")
+
+    try:
+        session = settings.Session()
+        task = session.query(TaskInstance).filter(TaskInstance.job_id == job_id).first()
+        session.close()
+
+        if not task:
+            return ApiResponse.success(ApiUtil.format_task_instance(task))
+        else:
+            return ApiResponse.success(task)
+    except Exception as e:
+        error_message = "An error occurred while trying to get_dag_task_instance of DAG '" + str(job_id) + "': " + str(
+            e)
+        logging.error(error_message)
+        return ApiResponse.server_error(error_message)
+
+
+@csrf.exempt
 @airflow_api_blueprint.route('/task_stats', methods=['GET'])
-def get_task_stats():
-    logging.info("Executing custom 'get_task_stats' function")
+def list_task_stats():
+    logging.info("Executing custom 'list_task_stats' function")
     try:
         # Recall Airflow Delete URL
         from airflow.www.views import Airflow
         return Airflow().task_stats()
     except Exception as e:
-        error_message = "An error occurred while trying to task_stats'" + "': " + str(e)
+        error_message = "An error occurred while trying to list_task_stats'" + "': " + str(e)
+        logging.error(error_message)
+        return ApiResponse.server_error(error_message)
+
+
+@csrf.exempt
+@airflow_api_blueprint.route('/task_log', methods=['GET'])
+def find_task_log():
+    logging.info("Executing custom 'find_task_log' function")
+    try:
+        dag_id = request.args.get('dag_id')
+        task_id = request.args.get('task_id')
+        execution_date = request.args.get('execution_date')
+        dttm = pendulum.parse(execution_date)
+
+        try:
+            from airflow.utils import timezone
+            execution_date = timezone.parse(execution_date)
+        except ValueError:
+            error_message = (
+                'Given execution date, {}, could not be identified '
+                'as a date. Example date format: 2015-11-16T14:34:15+00:00'.format(
+                    execution_date))
+            return ApiResponse.bad_request(error_message)
+
+        if request.args.get('try_number') is not None:
+            try_number = int(request.args.get('try_number'))
+        else:
+            try_number = None
+
+        session = settings.Session()
+        ti = session.query(TaskInstance).filter(
+            TaskInstance.dag_id == dag_id,
+            TaskInstance.task_id == task_id,
+            TaskInstance.execution_date == dttm).first()
+        session.close()
+
+        if ti is None:
+            return ApiResponse.success("*** Task instance did not exist in the DB\n")
+        else:
+            dag = DagBag("dags").get_dag(dag_id)
+            ti.task = dag.get_task(ti.task_id)
+
+            logger = logging.getLogger('airflow.task')
+            task_log_reader = configuration.conf.get('core', 'task_log_reader')
+            handler = next((handler for handler in logger.handlers
+                            if handler.name == task_log_reader), None)
+
+            logs = handler.read(ti, try_number)
+
+            if logs:
+                return ApiResponse.success(logs[0])
+            else:
+                return ApiResponse.success("No More Log")
+    except Exception as e:
+        error_message = "An error occurred while trying to find_task_log'" + "': " + str(e)
+        logging.error(error_message)
+        return ApiResponse.server_error(error_message)
+
+
+@csrf.exempt
+@airflow_api_blueprint.route('/task_log/<job_id>', methods=['GET'])
+def get_task_log(job_id):
+    logging.info("Executing custom 'get_task_log' function")
+    try:
+
+        session = settings.Session()
+        ti = session.query(TaskInstance).filter(TaskInstance.job_id == job_id).first()
+        session.close()
+
+        if ti is not None:
+            dag = DagBag("dags").get_dag(ti.dag_id)
+            ti.task = dag.get_task(ti.task_id)
+
+            logger = logging.getLogger('airflow.task')
+            task_log_reader = configuration.conf.get('core', 'task_log_reader')
+            handler = next((handler for handler in logger.handlers
+                            if handler.name == task_log_reader), None)
+
+            logs = handler.read(ti, None)
+            if logs:
+                return ApiResponse.success(logs[0])
+            else:
+                return ApiResponse.success("No More Log")
+        else:
+            return ApiResponse.success("*** Task instance did not exist in the DB\n")
+    except Exception as e:
+        error_message = "An error occurred while trying to get_task_log'" + "': " + str(e)
         logging.error(error_message)
         return ApiResponse.server_error(error_message)
 
